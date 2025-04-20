@@ -95,8 +95,12 @@ class TCN(BaseRecurrent):
         lr_scheduler=None,
         lr_scheduler_kwargs=None,
         dataloader_kwargs=None,
+        debug_print=False,
         **trainer_kwargs
     ):
+        if debug_print:
+            self.forward = self.forward_with_print
+            
         super(TCN, self).__init__(
             h=h,
             input_size=input_size,
@@ -179,6 +183,7 @@ class TCN(BaseRecurrent):
         )
         self.alpha_scale = nn.Parameter(torch.tensor(0.005))
         self.alpha_correction = nn.Parameter(torch.tensor(0.0))
+        self.debug_print = debug_print
 
     def forward(self, windows_batch):
 
@@ -235,6 +240,74 @@ class TCN(BaseRecurrent):
 
         # Final forecast
         output = self.mlp_decoder(context)
+        output = self.loss.domain_map(output)
+
+        return output
+
+    def forward_with_print(self, windows_batch):
+
+        # Parse windows_batch
+        encoder_input = windows_batch["insample_y"]  # [B, seq_len, 1]
+        futr_exog = windows_batch["futr_exog"]
+        hist_exog = windows_batch["hist_exog"]
+        stat_exog = windows_batch["stat_exog"]
+
+        # Concatenate y, historic and static inputs
+        # [B, C, seq_len, 1] -> [B, seq_len, C]
+        # Contatenate [ Y_t, | X_{t-L},..., X_{t} | S ]
+        batch_size, seq_len = encoder_input.shape[:2]
+        if self.hist_exog_size > 0:
+            hist_exog = hist_exog.permute(0, 2, 1, 3).squeeze(
+                -1
+            )  # [B, X, seq_len, 1] -> [B, seq_len, X]
+            encoder_input = torch.cat((encoder_input, hist_exog), dim=2)
+            if self.debug_print: print(f"Input Shape: {encoder_input.shape}")
+
+        if self.stat_exog_size > 0:
+            stat_exog = stat_exog.unsqueeze(1).repeat(
+                1, seq_len, 1
+            )  # [B, S] -> [B, seq_len, S]
+            encoder_input = torch.cat((encoder_input, stat_exog), dim=2)
+
+        # TCN forward
+        hidden_state = self.hist_encoder(
+            encoder_input
+        )  # [B, seq_len, tcn_hidden_state]
+        if self.debug_print: print(f"Output TCN Shape: {hidden_state.shape}")
+
+        # Transformer with residual connection
+        original_hidden = hidden_state
+        if self.debug_print: print(f"Output After TCN: {hidden_state}")
+        hidden_state = hidden_state.permute(1, 0, 2)  # [seq_len, B, D]
+        hidden_state = self.transformer(hidden_state)
+        hidden_state = hidden_state.permute(1, 0, 2)  # [B, seq_len, D]
+        if self.debug_print: print(f"Output After Transformer: {hidden_state}")
+        alpha = torch.tanh(self.alpha_correction) * self.alpha_scale
+        if self.debug_print: print(f"Output Alpha: {alpha}")
+        hidden_state = original_hidden + (hidden_state * alpha)
+        if self.debug_print: print(f"Output Hidden State After Transformer: {hidden_state}")
+
+        if self.futr_exog_size > 0:
+            futr_exog = futr_exog.permute(0, 2, 3, 1)[
+                :, :, 1:, :
+            ]  # [B, F, seq_len, 1+H] -> [B, seq_len, H, F]
+            hidden_state = torch.cat(
+                (hidden_state, futr_exog.reshape(batch_size, seq_len, -1)), dim=2
+            )
+
+        # Context adapter
+        if self.debug_print: print(f"Output Shape Before Context: {hidden_state.shape}")
+        context = self.context_adapter(hidden_state)
+        context = context.reshape(batch_size, seq_len, self.h, self.context_size)
+        if self.debug_print: print(f"Output Shape After Context: {context.shape}")
+
+        # Residual connection with futr_exog
+        if self.futr_exog_size > 0:
+            context = torch.cat((context, futr_exog), dim=-1)
+
+        # Final forecast
+        output = self.mlp_decoder(context)
+        if self.debug_print: print(f"Output Shape After MLP: {output.shape}")
         output = self.loss.domain_map(output)
 
         return output
