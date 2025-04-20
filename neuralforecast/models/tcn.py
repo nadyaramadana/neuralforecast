@@ -12,6 +12,7 @@ import torch.nn as nn
 from ..losses.pytorch import MAE
 from ..common._base_recurrent import BaseRecurrent
 from ..common._modules import MLP, TemporalConvolutionEncoder
+from torch.nn import TransformerEncoder, TransformerEncoderLayer
 
 # %% ../../nbs/models.tcn.ipynb 7
 class TCN(BaseRecurrent):
@@ -67,9 +68,9 @@ class TCN(BaseRecurrent):
         input_size: int = -1,
         inference_input_size: int = -1,
         kernel_size: int = 2,
-        dilations: List[int] = [1, 2, 4, 8, 16],
+        dilations: List[int] = [1, 2, 4, 8],
         encoder_hidden_size: int = 200,
-        encoder_activation: str = "ReLU",
+        encoder_activation: str = "PReLU",
         context_size: int = 10,
         decoder_hidden_size: int = 200,
         decoder_layers: int = 2,
@@ -150,6 +151,16 @@ class TCN(BaseRecurrent):
             dilations=self.dilations,
             activation=self.encoder_activation,
         )
+        
+        # Transformer Encoder Layer
+        transformer_layer = TransformerEncoderLayer(
+            d_model=self.encoder_hidden_size,
+            nhead=8,
+            dim_feedforward=self.encoder_hidden_size,
+            dropout=0.2,
+            batch_first=False
+        )
+        self.transformer = TransformerEncoder(transformer_layer, num_layers=1)
 
         # Context adapter
         self.context_adapter = nn.Linear(
@@ -166,6 +177,8 @@ class TCN(BaseRecurrent):
             activation="ReLU",
             dropout=0.0,
         )
+        self.alpha_scale = nn.Parameter(torch.tensor(0.005))
+        self.alpha_correction = nn.Parameter(torch.tensor(0.0))
 
     def forward(self, windows_batch):
 
@@ -195,6 +208,14 @@ class TCN(BaseRecurrent):
         hidden_state = self.hist_encoder(
             encoder_input
         )  # [B, seq_len, tcn_hidden_state]
+
+        # Transformer with residual connection
+        original_hidden = hidden_state
+        hidden_state = hidden_state.permute(1, 0, 2)  # [seq_len, B, D]
+        hidden_state = self.transformer(hidden_state)
+        hidden_state = hidden_state.permute(1, 0, 2)  # [B, seq_len, D]
+        alpha = torch.tanh(self.alpha_correction) * self.alpha_scale
+        hidden_state = original_hidden + (hidden_state * alpha)
 
         if self.futr_exog_size > 0:
             futr_exog = futr_exog.permute(0, 2, 3, 1)[
