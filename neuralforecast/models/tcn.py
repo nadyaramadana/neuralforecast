@@ -62,6 +62,7 @@ class TCN(BaseRecurrent):
     EXOGENOUS_HIST = True
     EXOGENOUS_STAT = True
 
+    # constructor 
     def __init__(
         self,
         h: int,
@@ -70,6 +71,8 @@ class TCN(BaseRecurrent):
         kernel_size: int = 2,
         dilations: List[int] = [1, 2, 4, 8],
         encoder_hidden_size: int = 200,
+        # menggunakan PReLU untuk menghindari data yang setelah masuk ke TCN hilang ketika datanya minus
+        # karena kalau di ReLU jadi 0
         encoder_activation: str = "PReLU",
         context_size: int = 10,
         decoder_hidden_size: int = 200,
@@ -181,47 +184,80 @@ class TCN(BaseRecurrent):
             activation="ReLU",
             dropout=0.0,
         )
+
+        # parameter yang diperbaiki setiap iterasi
+        # ada di fungsi weightening
         self.alpha_scale = nn.Parameter(torch.tensor(0.005))
         self.alpha_correction = nn.Parameter(torch.tensor(0.0))
         self.debug_print = debug_print
 
-    def forward(self, windows_batch):
+    # fungsinya untuk melakukan penyetaraan saat skip connection,
+    # agar hasil fitur dari transformer tidak terlalu berubah jauh dari hasil tcn
+    # untuk ditambahkan nantinya sebelum MLP
+    # agar tidak menghilangkan data dari TCN
+    # range nilai TCN -0.01 sampai 0.01 dan transformer tanpa weightening -1 sampai 1  
+    def weightening(self):
+        # hyper tanh merupakan fungsi aktivasi dikalikan dengan alpha_scale 
+        # nilainya alpha_correction dan alpha_scale diperbaiki terus setiap iterasi
+        return torch.tanh(self.alpha_correction) * self.alpha_scale
 
-        # Parse windows_batch
-        encoder_input = windows_batch["insample_y"]  # [B, seq_len, 1]
-        futr_exog = windows_batch["futr_exog"]
-        hist_exog = windows_batch["hist_exog"]
-        stat_exog = windows_batch["stat_exog"]
+    # fungsi yang bertugas untuk memproses setiap input yang masuk di NAD-Tran
+    def forward(self, windows_batch):
+        # Mengambil data sample dan historic exogen
+        # insample_y -> key dari hashmap input data 21 hari
+        # encoder_input -> data input (21 hari)
+        encoder_input = windows_batch["insample_y"]  # format: [batch_size, input_data (21 hari)]
+        futr_exog = windows_batch["futr_exog"] # ga di panggil
+        hist_exog = windows_batch["hist_exog"] # data historis (19 fitur dengan 21 hari)
+        stat_exog = windows_batch["stat_exog"] # ga dipanggil
 
         # Concatenate y, historic and static inputs
         # [B, C, seq_len, 1] -> [B, seq_len, C]
         # Contatenate [ Y_t, | X_{t-L},..., X_{t} | S ]
-        batch_size, seq_len = encoder_input.shape[:2]
+        batch_size, seq_len = encoder_input.shape[:2] # mengambil batch_size dan data 21 hari sebelumnya 
         if self.hist_exog_size > 0:
             hist_exog = hist_exog.permute(0, 2, 1, 3).squeeze(
                 -1
             )  # [B, X, seq_len, 1] -> [B, seq_len, X]
-            encoder_input = torch.cat((encoder_input, hist_exog), dim=2)
+            encoder_input = torch.cat((encoder_input, hist_exog), dim=2) # digabungkan antara data input dan data feature historis lainnya
 
+        # tidak dipanggil (template neuralforecast) ======
         if self.stat_exog_size > 0:
             stat_exog = stat_exog.unsqueeze(1).repeat(
                 1, seq_len, 1
             )  # [B, S] -> [B, seq_len, S]
             encoder_input = torch.cat((encoder_input, stat_exog), dim=2)
+        # ==============
 
-        # TCN forward
-        hidden_state = self.hist_encoder(
+        # Masuk ke proses TCN
+        hasil_tcn = self.hist_encoder( # dilakukan proses ekstraksi dengan tcn
             encoder_input
-        )  # [B, seq_len, tcn_hidden_state]
+        )  # format: [input_data_21, batch_size, ukuran_hasil_ekstraksi]
+        
 
-        # Transformer with residual connection
-        original_hidden = hidden_state
-        hidden_state = hidden_state.permute(1, 0, 2)  # [seq_len, B, D]
-        hidden_state = self.transformer(hidden_state)
-        hidden_state = hidden_state.permute(1, 0, 2)  # [B, seq_len, D]
-        alpha = torch.tanh(self.alpha_correction) * self.alpha_scale
-        hidden_state = original_hidden + (hidden_state * alpha)
+        # ini digunakan untuk skip connection nantinya
+        # kegunaan skip connection fitur hasil TCN tidak hilang sepenuhnya melainkan tetap ada
+        hasil_fitur_tcn_sementara = hasil_tcn
+        
+        # Masuk ke proses Transformer
+        # Karena formatnya dari transformer itu [batch_size, input_data_21, ukuran_hasil_ekstraksi]
+        # maka data sebelumnya diputar dari  [input_data_21, batch_size, ukuran_hasil_ekstraksi] 
+        # menjadi [batch_size, input_data_21, ukuran_hasil_ekstraksi]
 
+        # diputar (dengan fungsi permute)
+        hasil_diputar = hasil_tcn.permute(1, 0, 2)  # hasilnya [batch_size, input_data_21, ukuran_hasil_ekstraksi]
+
+        # masuk ke transformer
+        # hasilnya [batch_size, input_data_21, hasil_ekstraksi_transformer]
+        hasil_transformer = self.transformer(hasil_diputar)
+
+        # setelah diputar dibalikkan lagi menjadi [input_data_21, batch_size, hasil_ekstraksi_transformer]
+        hasil_transformer_yang_dikembalikan = hasil_transformer.permute(1, 0, 2)  # hasilnya [input_data_21, batch_size, hasil_ekstraksi_transformer]
+
+        # dilakukan skip connection, lompatan dari hasil fitur tcn dengan hasil transforer yang telah diberikan scale   
+        hasil_skip_connection = hasil_fitur_tcn_sementara + (hasil_transformer_yang_dikembalikan * self.weightening())
+
+        # tidak dipanggil (template neuralforecast) ======
         if self.futr_exog_size > 0:
             futr_exog = futr_exog.permute(0, 2, 3, 1)[
                 :, :, 1:, :
@@ -229,21 +265,29 @@ class TCN(BaseRecurrent):
             hidden_state = torch.cat(
                 (hidden_state, futr_exog.reshape(batch_size, seq_len, -1)), dim=2
             )
+        # ==============
 
-        # Context adapter
-        context = self.context_adapter(hidden_state)
+        # Context adapter ===================
+        # 1 hidden layer template neuralforecast
+        context = self.context_adapter(hasil_skip_connection)
         context = context.reshape(batch_size, seq_len, self.h, self.context_size)
+        # ================
 
-        # Residual connection with futr_exog
+        # tidak dipanggil (template neuralforecast) ======
         if self.futr_exog_size > 0:
             context = torch.cat((context, futr_exog), dim=-1)
+        # ==============
 
-        # Final forecast
+        # Final forecast, untuk mendapatkan hasil prediksi
         output = self.mlp_decoder(context)
+
+        # hasil prediksi termasuk nilai lossnya
         output = self.loss.domain_map(output)
 
         return output
 
+
+    # Ini untuk debug yang diprint2
     def forward_with_print(self, windows_batch):
 
         # Parse windows_batch
